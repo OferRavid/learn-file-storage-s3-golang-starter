@@ -1,13 +1,19 @@
 package main
 
 import (
+	"bytes"
+	"encoding/json"
+	"errors"
 	"fmt"
 	"io"
 	"mime"
 	"net/http"
 	"os"
+	"os/exec"
+	"path/filepath"
 
 	"github.com/OferRavid/learn-file-storage-s3-golang-starter/internal/auth"
+	"github.com/aws/aws-sdk-go-v2/aws"
 	"github.com/aws/aws-sdk-go-v2/service/s3"
 	"github.com/google/uuid"
 )
@@ -74,15 +80,29 @@ func (cfg *apiConfig) handlerUploadVideo(w http.ResponseWriter, r *http.Request)
 
 	tmpVidFile.Seek(0, io.SeekStart)
 
-	assetPath := getAssetPath(mediaType)
-	videoURL := fmt.Sprintf("https://%s.s3.%s.amazonaws.com/%s", cfg.s3Bucket, cfg.s3Region, assetPath)
+	directory := ""
+	aspectRatio, err := getVideoAspectRatio(tmpVidFile.Name())
+	if err != nil {
+		respondWithError(w, http.StatusInternalServerError, "Couldn't get aspect ratio for video", err)
+	}
+	switch aspectRatio {
+	case "16:9":
+		directory = "landscape"
+	case "9:16":
+		directory = "portrait"
+	default:
+		directory = "other"
+	}
+
+	assetPath := filepath.Join(directory, getAssetPath(mediaType))
+	videoURL := cfg.getObjectURL(assetPath)
 	video.VideoURL = &videoURL
 
 	_, err = cfg.s3Client.PutObject(r.Context(), &s3.PutObjectInput{
-		Bucket:      &cfg.s3Bucket,
-		Key:         &assetPath,
+		Bucket:      aws.String(cfg.s3Bucket),
+		Key:         aws.String(assetPath),
 		Body:        tmpVidFile,
-		ContentType: &mediaType,
+		ContentType: aws.String(mediaType),
 	})
 	if err != nil {
 		respondWithError(w, http.StatusInternalServerError, "Failed upload to s3 bucket", err)
@@ -96,4 +116,44 @@ func (cfg *apiConfig) handlerUploadVideo(w http.ResponseWriter, r *http.Request)
 	}
 
 	respondWithJSON(w, http.StatusOK, video)
+}
+
+func getVideoAspectRatio(filePath string) (string, error) {
+	cmd := exec.Command("ffprobe", "-v", "error", "-print_format", "json", "-show_streams", filePath)
+	var cmdBuffer bytes.Buffer
+	cmd.Stdout = &cmdBuffer
+	err := cmd.Run()
+	if err != nil {
+		return "", fmt.Errorf("failed to run command ffprobe on file %s: %s", filePath, err)
+	}
+
+	var ratiosParams struct {
+		Streams []struct {
+			Width  int `json:"width"`
+			Height int `json:"height"`
+		}
+	}
+
+	err = json.Unmarshal(cmdBuffer.Bytes(), &ratiosParams)
+	if err != nil {
+		return "", fmt.Errorf("failed to unmarshal params: %s", err)
+	}
+
+	if len(ratiosParams.Streams) == 0 {
+		return "", errors.New("no video streams found")
+	}
+
+	width := ratiosParams.Streams[0].Width
+	height := ratiosParams.Streams[0].Height
+
+	return classifyAspectRatio(width, height), nil
+}
+
+func classifyAspectRatio(width, height int) string {
+	if width == 16*height/9 {
+		return "16:9"
+	} else if height == 16*width/9 {
+		return "9:16"
+	}
+	return "other"
 }
