@@ -65,7 +65,7 @@ func (cfg *apiConfig) handlerUploadVideo(w http.ResponseWriter, r *http.Request)
 		return
 	}
 
-	tmpVidFile, err := os.CreateTemp(cfg.assetsRoot, "tubely_upload.mp4")
+	tmpVidFile, err := os.CreateTemp("", "tubely_upload.mp4")
 	if err != nil {
 		respondWithError(w, http.StatusInternalServerError, "Unable to create file on server", err)
 		return
@@ -76,14 +76,29 @@ func (cfg *apiConfig) handlerUploadVideo(w http.ResponseWriter, r *http.Request)
 	_, err = io.Copy(tmpVidFile, videoFile)
 	if err != nil {
 		respondWithError(w, http.StatusInternalServerError, "Failed to copy data to file", err)
+		return
 	}
 
 	tmpVidFile.Seek(0, io.SeekStart)
+	tmpProcessedVidFile, err := processVideoForFastStart(tmpVidFile.Name())
+	if err != nil {
+		respondWithError(w, http.StatusInternalServerError, err.Error(), err)
+		return
+	}
+
+	processedVidFile, err := os.Open(tmpProcessedVidFile)
+	if err != nil {
+		respondWithError(w, http.StatusInternalServerError, "failed to open processed video file", err)
+	}
+
+	defer os.Remove(tmpProcessedVidFile)
+	defer processedVidFile.Close()
 
 	directory := ""
 	aspectRatio, err := getVideoAspectRatio(tmpVidFile.Name())
 	if err != nil {
 		respondWithError(w, http.StatusInternalServerError, "Couldn't get aspect ratio for video", err)
+		return
 	}
 	switch aspectRatio {
 	case "16:9":
@@ -101,7 +116,7 @@ func (cfg *apiConfig) handlerUploadVideo(w http.ResponseWriter, r *http.Request)
 	_, err = cfg.s3Client.PutObject(r.Context(), &s3.PutObjectInput{
 		Bucket:      aws.String(cfg.s3Bucket),
 		Key:         aws.String(assetPath),
-		Body:        tmpVidFile,
+		Body:        processedVidFile,
 		ContentType: aws.String(mediaType),
 	})
 	if err != nil {
@@ -156,4 +171,30 @@ func classifyAspectRatio(width, height int) string {
 		return "9:16"
 	}
 	return "other"
+}
+
+func processVideoForFastStart(filePath string) (string, error) {
+	processedFilePath := fmt.Sprintf("%s.processing", filePath)
+	cmd := exec.Command("ffmpeg",
+		"-i", filePath,
+		"-c", "copy",
+		"-movflags", "faststart",
+		"-f", "mp4",
+		processedFilePath,
+	)
+	var stderr bytes.Buffer
+	cmd.Stderr = &stderr
+
+	if err := cmd.Run(); err != nil {
+		return "", fmt.Errorf("error processing video: %s, %v", stderr.String(), err)
+	}
+
+	fileInfo, err := os.Stat(processedFilePath)
+	if err != nil {
+		return "", fmt.Errorf("could not stat processed file: %v", err)
+	}
+	if fileInfo.Size() == 0 {
+		return "", fmt.Errorf("processed file is empty")
+	}
+	return processedFilePath, nil
 }
